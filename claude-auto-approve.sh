@@ -49,7 +49,17 @@ tell application "iTerm2"
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
-        set output to output & idx & "|" & (tty of s) & "|" & (name of s) & "
+        set c to contents of s
+        set cLen to length of c
+        set snippet to ""
+        if cLen > 400 then
+          set snippet to text (cLen - 400) thru cLen of c
+        else
+          set snippet to c
+        end if
+        -- flatten newlines to pipe for transport
+        set snippet to do shell script "echo " & quoted form of snippet & " | tr '\\n' '~' | tr '|' ' '"
+        set output to output & idx & "|" & (tty of s) & "|" & (name of s) & "|" & snippet & "
 "
         set idx to idx + 1
       end repeat
@@ -63,19 +73,23 @@ ASCRIPT
     echo "No iTerm2 sessions found."
     return
   fi
-  printf "\n%-4s %-14s %-35s %s\n" "#" "TTY" "Session Name" "Doing"
-  printf "%-4s %-14s %-35s %s\n" "----" "--------------" "-----------------------------------" "------------------------------"
-  while IFS='|' read -r idx tty name; do
+  printf "\n%-4s %-14s %-32s %s\n" "#" "TTY" "Session Name" "Last Activity"
+  printf "%-4s %-14s %-32s %s\n" "----" "--------------" "--------------------------------" "----------------------------------------------"
+  while IFS='|' read -r idx tty name snippet; do
     [[ -z "$idx" ]] && continue
-    local short_tty="${tty#/dev/}"
-    local doing
-    doing=$(ps -t "$short_tty" -o args= 2>/dev/null \
-      | grep -Ev '^\s*(-bash|-zsh|bash|zsh|login|ps |grep)' \
-      | head -1 \
-      | sed 's|.*/||; s/ .*$//' \
-      | cut -c1-30)
-    [[ -z "$doing" ]] && doing="idle"
-    printf "%-4s %-14s %-35s %s\n" "$idx" "$tty" "$name" "$doing"
+    # Extract last meaningful non-empty, non-prompt line from snippet
+    local activity
+    activity=$(echo "$snippet" \
+      | tr '~' '\n' \
+      | grep -Ev '^\s*$|^\s*[>$%#❯]\s*$|^\s*\.\.\.|^✻|^─' \
+      | tail -3 \
+      | grep -v '^\s*$' \
+      | tail -1 \
+      | sed 's/^[[:space:]]*//' \
+      | cut -c1-46)
+    [[ -z "$activity" ]] && activity="$(ps -t "${tty#/dev/}" -o args= 2>/dev/null | grep -Ev '^\s*(-bash|-zsh|bash|zsh|login)' | head -1 | sed 's|.*/||' | cut -c1-46)"
+    [[ -z "$activity" ]] && activity="idle"
+    printf "%-4s %-14s %-32s %s\n" "$idx" "$tty" "$name" "$activity"
   done <<< "$raw"
   echo ""
 }
@@ -175,6 +189,82 @@ end tell
 ASCRIPT
 }
 
+project_from_content() {
+  local content
+  content=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+  if   echo "$content" | grep -qE 'moxy|10\.3\.201\.193|moxygraph|crawlee|uvicorn'; then
+    echo "MoxyGraph"
+  elif echo "$content" | grep -qE 'claude.watcher|claude.auto.approve|auto.approv|stop.and.notify'; then
+    echo "claude-watcher"
+  elif echo "$content" | grep -qE 'dit-|dit triage|rcca|/dit/|dit\.py'; then
+    echo "DIT Triage"
+  elif echo "$content" | grep -qE 'inception|inception.test'; then
+    echo "Inception Tests"
+  elif echo "$content" | grep -qE 'friday.receipt|qa.metric|weekly.metric'; then
+    echo "QA Metrics"
+  elif echo "$content" | grep -qE 'bigquery|aqueduct'; then
+    echo "BigQuery / AIOps"
+  elif echo "$content" | grep -qE 'send.slack|self.dm|slack.dm'; then
+    echo "Slack Tools"
+  elif echo "$content" | grep -qE 'gmail|email.tracker|reply.tracker'; then
+    echo "Email Tools"
+  elif echo "$content" | grep -qE 'google.cal|calendar'; then
+    echo "Calendar"
+  else
+    local fname
+    fname=$(echo "$content" | grep -oE '[a-z0-9_-]+\.(py|sh|yaml|yml|ts|js|go)' | tail -1)
+    [[ -n "$fname" ]] && echo "$fname" || echo ""
+  fi
+}
+
+rename_sessions() {
+  # Fetch all session ttys + last 600 chars of content in one AppleScript pass
+  local raw
+  raw=$(osascript << 'ASCRIPT' 2>/dev/null
+tell application "iTerm2"
+  set output to ""
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        set c to contents of s
+        set cLen to length of c
+        if cLen > 600 then set c to text (cLen - 600) thru cLen of c
+        set snippet to do shell script "printf '%s' " & quoted form of c & " | tr '\\n|' '~~'"
+        set output to output & (tty of s) & "|" & snippet & "
+"
+      end repeat
+    end repeat
+  end repeat
+  return output
+end tell
+ASCRIPT
+)
+  [[ -z "$raw" ]] && return
+
+  local rules=""
+  while IFS='|' read -r tty snippet; do
+    [[ -z "$tty" ]] && continue
+    local proj
+    proj=$(project_from_content "$snippet")
+    [[ -z "$proj" ]] && continue
+    rules+="        if sessionTty is \"$tty\" then set name of s to \"$proj\"
+"
+  done <<< "$raw"
+  [[ -z "$rules" ]] && return
+
+  osascript << ASCRIPT 2>/dev/null
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        set sessionTty to tty of s
+$rules      end repeat
+    end repeat
+  end repeat
+end tell
+ASCRIPT
+}
+
 get_iterm2_ttys() {
   osascript << 'ASCRIPT' 2>/dev/null
 tell application "iTerm2"
@@ -228,7 +318,14 @@ watch_loop() {
   }
 
   local stuck_check_counter=0
+  local rename_counter=10  # trigger rename on first cycle too
   while true; do
+    # Rename sessions every ~30s (10 cycles × 3s)
+    rename_counter=$((rename_counter + 1))
+    if [[ $rename_counter -ge 10 ]]; then
+      rename_counter=0
+      rename_sessions
+    fi
     result=$(check_and_approve || echo "ERROR")
     if [[ "$result" == APPROVED:* ]]; then
       count="${result#APPROVED:}"
