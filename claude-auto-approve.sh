@@ -51,6 +51,7 @@ status() {
 check_and_approve() {
   osascript << ASCRIPT
 tell application "iTerm2"
+  set approvedCount to 0
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
@@ -63,11 +64,14 @@ tell application "iTerm2"
           tell s
             write text ""
           end tell
-          return "APPROVED"
+          set approvedCount to approvedCount + 1
         end if
       end repeat
     end repeat
   end repeat
+  if approvedCount > 0 then
+    return "APPROVED:" & approvedCount
+  end if
   return "NONE"
 end tell
 ASCRIPT
@@ -81,8 +85,9 @@ watch_loop() {
 
   while true; do
     result=$(check_and_approve 2>/dev/null || echo "ERROR")
-    if [[ "$result" == "APPROVED" ]]; then
-      log "Prompt detected — approved"
+    if [[ "$result" == APPROVED:* ]]; then
+      count="${result#APPROVED:}"
+      log "Approved $count session(s)"
       sleep 5   # back off after approving, give session time to advance
     elif [[ "$result" == "ERROR" ]]; then
       log "AppleScript error (iTerm2 not running?)"
